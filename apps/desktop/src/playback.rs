@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Matthew Butler
+//
+// dee-nice is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -48,6 +63,9 @@ pub struct LaunchSpec<'a> {
     pub initial_clip: Option<&'a str>,
     /// Relative clip path to a finished lighter copy. Missing keys play the source.
     pub ready: &'a BTreeMap<String, PathBuf>,
+    /// Full layout loads the file in the key binding. A divided layout only
+    /// reports the key, and the session plays it in that slot.
+    pub direct: bool,
     pub input_conf: &'a Path,
     pub ipc_socket: &'a Path,
     pub script: &'a Path,
@@ -61,7 +79,7 @@ pub fn launch_plan(spec: &LaunchSpec<'_>) -> Result<LaunchPlan, PlanError> {
         return Err(PlanError::DisplayName);
     }
     let input_conf = chord_input_conf();
-    let clip_section = clip_section(spec.media_directory, spec.bindings, spec.ready)?;
+    let clip_section = clip_section(spec.media_directory, spec.bindings, spec.ready, spec.direct)?;
     let initial_clip = match spec.initial_clip {
         Some(clip) => Some(mpv_path(&playback_path(
             spec.media_directory,
@@ -91,21 +109,47 @@ pub fn clip_section(
     directory: &Path,
     bindings: &[PlaybackBinding],
     ready: &BTreeMap<String, PathBuf>,
+    direct: bool,
 ) -> Result<String, PlanError> {
     let mut lines = Vec::new();
     for binding in bindings {
-        let BindingAction::Play { clip } = &binding.action else {
-            continue;
+        let line = match &binding.action {
+            BindingAction::Play { clip, .. } if direct => {
+                let path = playback_path(directory, clip, ready)?;
+                format!(
+                    "{} loadfile {} replace; script-message dee-nice play {}",
+                    mpv_key(binding.chord),
+                    quote_mpv(&mpv_path(&path)?)?,
+                    binding.chord.key().name(),
+                )
+            }
+            BindingAction::Black { .. } if direct => format!(
+                "{} stop; script-message dee-nice play {}",
+                mpv_key(binding.chord),
+                binding.chord.key().name(),
+            ),
+            BindingAction::Play { .. } | BindingAction::Black { .. } => format!(
+                "{} script-message dee-nice play {}",
+                mpv_key(binding.chord),
+                binding.chord.key().name(),
+            ),
+            BindingAction::ToggleLock | BindingAction::ExitDisplay => continue,
         };
-        let path = playback_path(directory, clip, ready)?;
-        lines.push(format!(
-            "{} loadfile {} replace; script-message dee-nice play {}",
-            mpv_key(binding.chord),
-            quote_mpv(&mpv_path(&path)?)?,
-            binding.chord.key().name(),
-        ));
+        lines.push(line);
     }
     Ok(lines.join("\n"))
+}
+
+pub fn loadfile_command(
+    directory: &Path,
+    clip: &str,
+    ready: &BTreeMap<String, PathBuf>,
+) -> Result<serde_json::Value, String> {
+    let path = playback_path(directory, clip, ready).map_err(|error| error.to_string())?;
+    let path = mpv_path(&path).map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({
+        "command": ["loadfile", path, "replace"]
+    }))
 }
 
 fn playback_path(
@@ -130,10 +174,11 @@ pub fn render_input_conf(
     for binding in bindings {
         let key = mpv_key(binding.chord);
         let command = match &binding.action {
-            BindingAction::Play { clip } => {
+            BindingAction::Play { clip, .. } => {
                 let path = media::resolve_clip(directory, clip).map_err(PlanError::Clip)?;
                 format!("loadfile {} replace", quote_mpv(&mpv_path(&path)?)?)
             }
+            BindingAction::Black { .. } => "stop".to_string(),
             BindingAction::ToggleLock => "script-message dee-nice lock".to_string(),
             BindingAction::ExitDisplay => "quit".to_string(),
         };
@@ -144,26 +189,61 @@ pub fn render_input_conf(
 }
 
 fn mpv_arguments(spec: &LaunchSpec<'_>) -> Vec<String> {
+    let mut arguments = shared_arguments(spec.display_name, spec.muted);
+    arguments.extend([
+        "--fullscreen".to_string(),
+        format!("--fs-screen-name={}", spec.display_name),
+        "--ontop=yes".to_string(),
+        format!("--input-conf={}", spec.input_conf.display()),
+        format!("--input-ipc-server={}", spec.ipc_socket.display()),
+        format!("--script={}", spec.script.display()),
+    ]);
+    if !spec.direct {
+        // Stay in the current Space so the slot windows can sit on top.
+        arguments.push("--native-fs=no".to_string());
+        arguments.push("--ontop-level=0".to_string());
+    }
+    arguments
+}
+
+pub fn slot_arguments(
+    display_name: &str,
+    geometry: &str,
+    muted: bool,
+    ipc_socket: &Path,
+    input_conf: &Path,
+    script: &Path,
+) -> Vec<String> {
+    let mut arguments = shared_arguments(display_name, muted);
+    arguments.extend([
+        "--no-border".to_string(),
+        "--ontop=yes".to_string(),
+        "--ontop-level=1".to_string(),
+        "--focus-on=never".to_string(),
+        "--macos-geometry-calculation=whole".to_string(),
+        format!("--geometry={geometry}"),
+        format!("--input-conf={}", input_conf.display()),
+        format!("--input-ipc-server={}", ipc_socket.display()),
+        format!("--script={}", script.display()),
+    ]);
+    arguments
+}
+
+fn shared_arguments(display_name: &str, muted: bool) -> Vec<String> {
     let mut arguments = vec![
         "--no-config".to_string(),
         "--idle=yes".to_string(),
         "--force-window=immediate".to_string(),
-        "--fullscreen".to_string(),
-        format!("--screen-name={}", spec.display_name),
-        format!("--fs-screen-name={}", spec.display_name),
+        format!("--screen-name={display_name}"),
         "--loop-file=inf".to_string(),
         "--keepaspect=yes".to_string(),
         "--no-osc".to_string(),
         "--osd-level=0".to_string(),
         "--no-input-default-bindings".to_string(),
         "--cursor-autohide=1000".to_string(),
-        "--ontop=yes".to_string(),
-        format!("--input-conf={}", spec.input_conf.display()),
-        format!("--input-ipc-server={}", spec.ipc_socket.display()),
-        format!("--script={}", spec.script.display()),
         "--msg-level=all=error".to_string(),
     ];
-    if spec.muted {
+    if muted {
         arguments.push("--mute=yes".to_string());
     }
     arguments
@@ -253,7 +333,7 @@ fn mpv_file_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dee_nice_core::{Key, Show};
+    use dee_nice_core::{Key, Show, Slot};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -309,7 +389,7 @@ mod tests {
         let dir = TempDir::new();
         fs::write(dir.0.join("a.mp4"), b"video").unwrap();
         let mut show = Show::new(&dir.0).unwrap();
-        show.assign(key("a"), "a.mp4").unwrap();
+        show.assign(key("a"), "a.mp4", Slot::Full).unwrap();
         let open = render_input_conf(&dir.0, &show.playback_bindings(false)).unwrap();
         assert!(open.contains("loadfile "));
         assert!(open.contains(" replace"));
@@ -319,11 +399,43 @@ mod tests {
         assert!(!locked.contains("loadfile"));
         assert!(locked.contains("ctrl+L script-message dee-nice lock"));
         assert!(locked.contains("ctrl+K quit"));
-        let section =
-            clip_section(&dir.0, &show.playback_bindings(false), &BTreeMap::new()).unwrap();
+        let section = clip_section(
+            &dir.0,
+            &show.playback_bindings(false),
+            &BTreeMap::new(),
+            true,
+        )
+        .unwrap();
         assert!(section.contains("loadfile "));
         assert!(section.contains("script-message dee-nice play a"));
         assert!(!section.contains("quit"));
+        show.assign_black(key("b"), Slot::Full).unwrap();
+        let with_black = clip_section(
+            &dir.0,
+            &show.playback_bindings(false),
+            &BTreeMap::new(),
+            true,
+        )
+        .unwrap();
+        assert!(with_black.contains("b stop; script-message dee-nice play b"));
+        let routed = clip_section(
+            &dir.0,
+            &show.playback_bindings(false),
+            &BTreeMap::new(),
+            false,
+        )
+        .unwrap();
+        assert!(!routed.contains("loadfile"));
+        assert!(routed.contains("script-message dee-nice play a"));
+        assert!(routed.contains("b script-message dee-nice play b"));
+        let locked_black = clip_section(
+            &dir.0,
+            &show.playback_bindings(true),
+            &BTreeMap::new(),
+            true,
+        )
+        .unwrap();
+        assert!(locked_black.is_empty());
         let chords = chord_input_conf();
         assert!(!chords.contains("loadfile"));
         assert!(chords.contains("ctrl+L script-message dee-nice lock"));
@@ -345,6 +457,7 @@ mod tests {
             muted: true,
             initial_clip: Some("a.mp4"),
             ready: &ready,
+            direct: true,
             input_conf: &input,
             ipc_socket: ipc,
             script: &script,

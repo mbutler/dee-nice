@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Matthew Butler
+//
+// dee-nice is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
@@ -408,7 +423,7 @@ fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dee_nice_core::Key;
+    use dee_nice_core::{Key, Slot};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -477,7 +492,7 @@ mod tests {
         assert_eq!(startup.show.output_display().unwrap().name(), "Studio");
         assert_eq!(fs::read_to_string(&legacy).unwrap(), body);
         let portable = fs::read_to_string(&startup.show_path).unwrap();
-        assert!(portable.contains("\"schema_version\": 2"));
+        assert!(portable.contains("\"schema_version\": 4"));
         assert!(!portable.contains("Studio"));
         assert!(!portable.contains("media_directory"));
 
@@ -505,11 +520,13 @@ mod tests {
         let media = TempDir::new();
         let other = TempDir::new();
         let mut first = Show::new(&media.0).unwrap();
-        first.assign(Key::from_name("a").unwrap(), "a.mp4").unwrap();
+        first
+            .assign(Key::from_name("a").unwrap(), "a.mp4", Slot::Full)
+            .unwrap();
         save(&portable_show_path(&media.0), &first).unwrap();
         let mut second = Show::new(&other.0).unwrap();
         second
-            .assign(Key::from_name("b").unwrap(), "b.mp4")
+            .assign(Key::from_name("b").unwrap(), "b.mp4", Slot::Full)
             .unwrap();
         save(&portable_show_path(&other.0), &second).unwrap();
 

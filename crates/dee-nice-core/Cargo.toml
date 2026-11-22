@@ -3,6 +3,7 @@ name = "dee-nice-core"
 description = "Show document, key assignments, and playback bindings for dee-nice"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 publish.workspace = true
 
 [dependencies]

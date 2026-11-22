@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Matthew Butler
+//
+// dee-nice is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
@@ -5,12 +20,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use dee_nice_core::{BindingAction, PlaybackBinding, Show};
+use dee_nice_core::{BindingAction, PlaybackBinding, Show, Slot};
 
+use crate::layout;
 use crate::playback::{self, EVENT_SCRIPT};
-use crate::readiness::starting_clip;
+use crate::readiness::opening_cues;
 
 pub enum SessionUpdate {
     Running,
@@ -32,13 +48,22 @@ pub struct MpvSession {
     clip_section: String,
     clips_installed: bool,
     initial_clip: Option<String>,
-    live_key: Option<String>,
+    live_slots: BTreeMap<Slot, String>,
+    routed: bool,
+    slots: Vec<SlotPlayer>,
+    auto_lock: Option<Duration>,
+    idle_since: Instant,
     stop_reason: Option<String>,
     observed: bool,
+    awake: Option<Child>,
 }
 
 impl MpvSession {
-    pub fn start(show: &Show, ready: &BTreeMap<String, PathBuf>) -> Result<Self, String> {
+    pub fn start(
+        show: &Show,
+        ready: &BTreeMap<String, PathBuf>,
+        screen: (u32, u32),
+    ) -> Result<Self, String> {
         let binary = playback::mpv_binary().ok_or_else(|| "mpv was not found.".to_string())?;
         let display_name = show
             .output_display()
@@ -51,7 +76,7 @@ impl MpvSession {
         let directory =
             std::env::temp_dir().join(format!("dee-nice-{}-{nonce}", std::process::id()));
         fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-        match Self::spawn(show, ready, &binary, &display_name, &directory) {
+        match Self::spawn(show, ready, &binary, &display_name, &directory, screen) {
             Ok(session) => Ok(session),
             Err(error) => {
                 let _ = fs::remove_dir_all(&directory);
@@ -66,19 +91,26 @@ impl MpvSession {
         binary: &Path,
         display_name: &str,
         directory: &Path,
+        screen: (u32, u32),
     ) -> Result<Self, String> {
         let input_conf_path = directory.join("input.conf");
         let script_path = directory.join("events.lua");
         // Socket paths on macOS have to stay short, so the socket stays in the
         // system temp directory instead of the longer session folder.
-        let ipc_path = short_socket_path();
+        let ipc_path = short_socket_path(0);
         let _ = fs::remove_file(&ipc_path);
         fs::write(&script_path, EVENT_SCRIPT).map_err(|error| error.to_string())?;
         let locked = show.start_locked();
         // Clip keys are installed from the unlocked map. Lock only disables that
         // section; it does not forget the assignments.
         let bindings = show.playback_bindings(false);
-        let initial = starting_clip(show).map(|(_, clip)| clip);
+        let cues = opening_cues(show);
+        let direct = show.template().is_full();
+        let initial = if direct {
+            cues.first().and_then(|cue| cue.clip.clone())
+        } else {
+            None
+        };
         let plan = playback::launch_plan(&playback::LaunchSpec {
             media_directory: show.media_directory(),
             bindings: &bindings,
@@ -86,6 +118,7 @@ impl MpvSession {
             muted: show.muted(),
             initial_clip: initial.as_deref(),
             ready,
+            direct,
             input_conf: &input_conf_path,
             ipc_socket: &ipc_path,
             script: &script_path,
@@ -115,6 +148,49 @@ impl MpvSession {
             (Some(thread), None) | (None, Some(thread)) => Some(thread),
             (None, None) => None,
         };
+        let mut slots = Vec::new();
+        if !direct {
+            let aspect = if screen.1 == 0 {
+                16.0 / 9.0
+            } else {
+                f64::from(screen.0) / f64::from(screen.1)
+            };
+            for (index, slot) in show.template().slots().iter().copied().enumerate() {
+                let geometry = layout::slot_frame(show.template(), slot, aspect).mpv_geometry();
+                let pending = cues.iter().find(|cue| cue.slot == slot).and_then(|cue| {
+                    cue.clip.as_deref().and_then(|clip| {
+                        playback::loadfile_command(show.media_directory(), clip, ready).ok()
+                    })
+                });
+                match spawn_slot(&SlotLaunch {
+                    binary,
+                    display_name,
+                    geometry: &geometry,
+                    muted: show.muted(),
+                    directory: show.media_directory(),
+                    input_conf: &input_conf_path,
+                    script: &script_path,
+                    index: u32::try_from(index + 1).unwrap_or(1),
+                    slot,
+                    pending,
+                }) {
+                    Ok(player) => slots.push(player),
+                    Err(error) => {
+                        let _ = child.kill();
+                        for player in &mut slots {
+                            let _ = player.child.kill();
+                            let _ = fs::remove_file(&player.ipc_path);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        let mut live_slots = BTreeMap::new();
+        for cue in &cues {
+            live_slots.insert(cue.slot, cue.key_name.clone());
+        }
+        let awake = keep_awake(child.id());
         Ok(Self {
             child,
             stderr: log,
@@ -130,33 +206,39 @@ impl MpvSession {
             clip_section: plan.clip_section,
             clips_installed: false,
             initial_clip: plan.initial_clip,
-            live_key: if show.start_locked() {
-                show.playback_bindings(false)
-                    .into_iter()
-                    .find_map(|binding| {
-                        matches!(binding.action, BindingAction::Play { .. })
-                            .then(|| binding.chord.key().name())
-                    })
-            } else {
-                None
-            },
+            live_slots,
+            routed: !direct,
+            slots,
+            auto_lock: show
+                .auto_lock_seconds()
+                .map(|seconds| Duration::from_secs(u64::from(seconds))),
+            idle_since: Instant::now(),
             stop_reason: None,
             observed: false,
+            awake,
         })
     }
 
     pub fn poll(&mut self) -> SessionUpdate {
-        if let Some(reason) = &self.stop_reason {
-            let _ = self.child.kill();
-            return SessionUpdate::Stopped(reason.clone());
+        if let Some(reason) = self.stop_reason.clone() {
+            self.kill_all();
+            return SessionUpdate::Stopped(reason);
         }
         match self.child.try_wait() {
             Ok(Some(status)) => {
                 let stderr = self.stderr_text();
+                self.stop_awake();
+                self.kill_slots();
                 SessionUpdate::Stopped(stop_message(status, &stderr))
             }
             Ok(None) => {
+                if self.slot_closed() {
+                    self.kill_all();
+                    return SessionUpdate::Stopped("A slot window closed.".to_string());
+                }
                 self.pump_ipc();
+                self.pump_slots();
+                self.maybe_auto_lock();
                 if let Some(reason) = &self.stop_reason {
                     SessionUpdate::Stopped(reason.clone())
                 } else {
@@ -254,16 +336,18 @@ impl MpvSession {
             let Some(data) = value.get("data").and_then(|data| data.as_str()) else {
                 continue;
             };
-            match classify_event(data) {
-                Some(ShowEvent::Lock) => self.toggle_lock(),
-                Some(ShowEvent::Play(key)) => self.live_key = Some(key),
-                None => {}
+            if let Some(event) = classify_event(data) {
+                self.apply_event(event);
             }
         }
     }
 
-    pub fn live_key(&self) -> Option<&str> {
-        self.live_key.as_deref()
+    pub fn is_live(&self, name: &str) -> bool {
+        self.live_slots.values().any(|key| key == name)
+    }
+
+    pub fn live_names(&self) -> Vec<&str> {
+        self.live_slots.values().map(String::as_str).collect()
     }
 
     pub fn is_locked(&self) -> bool {
@@ -278,6 +362,7 @@ impl MpvSession {
             return;
         }
         let _ = self.child.kill();
+        self.kill_slots();
         self.stop_reason = Some("Left display mode.".to_string());
     }
 
@@ -297,10 +382,20 @@ impl MpvSession {
         self.reinstall_section();
     }
 
+    pub fn set_auto_lock(&mut self, seconds: Option<u32>) {
+        self.auto_lock = seconds
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| Duration::from_secs(u64::from(seconds)));
+        self.note_activity();
+    }
+
     fn reinstall_section(&mut self) {
-        let Ok(section) =
-            playback::clip_section(&self.media_directory, &self.bindings, &self.ready)
-        else {
+        let Ok(section) = playback::clip_section(
+            &self.media_directory,
+            &self.bindings,
+            &self.ready,
+            !self.routed,
+        ) else {
             return;
         };
         if section == self.clip_section {
@@ -316,6 +411,9 @@ impl MpvSession {
                     "command": ["enable-section", "dee-nice-clips"]
                 }));
             }
+        }
+        for player in &mut self.slots {
+            player.clips_installed = false;
         }
     }
 
@@ -338,7 +436,20 @@ impl MpvSession {
     }
 
     pub fn toggle_lock(&mut self) {
+        self.note_activity();
         self.locked = !self.locked;
+        self.apply_lock_section();
+    }
+
+    fn lock_keys(&mut self) {
+        if self.locked {
+            return;
+        }
+        self.locked = true;
+        self.apply_lock_section();
+    }
+
+    fn apply_lock_section(&mut self) {
         if !self.clips_installed || self.clip_section.is_empty() {
             return;
         }
@@ -347,9 +458,115 @@ impl MpvSession {
         } else {
             "enable-section"
         };
-        self.send_json(&serde_json::json!({
+        let value = serde_json::json!({
             "command": [command, "dee-nice-clips"]
-        }));
+        });
+        self.send_json(&value);
+        for player in &mut self.slots {
+            player.send(&value);
+        }
+    }
+
+    fn note_activity(&mut self) {
+        self.idle_since = Instant::now();
+    }
+
+    fn maybe_auto_lock(&mut self) {
+        if !auto_lock_due(self.locked, self.auto_lock, self.idle_since.elapsed()) {
+            return;
+        }
+        self.lock_keys();
+        self.note_activity();
+    }
+
+    fn apply_event(&mut self, event: ShowEvent) {
+        match event {
+            ShowEvent::Lock => self.toggle_lock(),
+            ShowEvent::Play(key) => self.play_key(key),
+        }
+    }
+
+    fn play_key(&mut self, key_name: String) {
+        self.note_activity();
+        let action = self
+            .bindings
+            .iter()
+            .find(|binding| binding.chord.key().name() == key_name)
+            .map(|binding| binding.action.clone());
+        if let Some(action) = action {
+            if let Some(slot) = action_slot(&action) {
+                self.live_slots.insert(slot, key_name);
+            }
+            if self.routed {
+                self.route(action);
+            }
+        }
+    }
+
+    fn route(&mut self, action: BindingAction) {
+        let (slot, command) = match action {
+            BindingAction::Play { clip, slot } => {
+                let Ok(command) =
+                    playback::loadfile_command(&self.media_directory, &clip, &self.ready)
+                else {
+                    return;
+                };
+                (slot, command)
+            }
+            BindingAction::Black { slot } => (
+                slot,
+                serde_json::json!({
+                    "command": ["stop"]
+                }),
+            ),
+            BindingAction::ToggleLock | BindingAction::ExitDisplay => return,
+        };
+        if let Some(player) = self.slots.iter_mut().find(|player| player.slot == slot) {
+            player.enqueue(command);
+        }
+    }
+
+    fn pump_slots(&mut self) {
+        let section = self.clip_section.clone();
+        let locked = self.locked;
+        let mut events = Vec::new();
+        for player in &mut self.slots {
+            player.pump(&section, locked, &mut events);
+        }
+        for event in events {
+            self.apply_event(event);
+        }
+    }
+
+    fn slot_closed(&mut self) -> bool {
+        self.slots
+            .iter_mut()
+            .any(|player| player.child.try_wait().ok().flatten().is_some())
+    }
+
+    fn kill_slots(&mut self) {
+        for player in &mut self.slots {
+            if player.child.try_wait().ok().flatten().is_none() {
+                let _ = player.child.kill();
+            }
+            let _ = fs::remove_file(&player.ipc_path);
+        }
+    }
+
+    fn kill_all(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        self.stop_awake();
+        self.kill_slots();
+    }
+
+    fn stop_awake(&mut self) {
+        if let Some(child) = self.awake.as_mut()
+            && child.try_wait().ok().flatten().is_none()
+        {
+            let _ = child.kill();
+        }
     }
 
     fn send_json(&mut self, value: &serde_json::Value) {
@@ -374,10 +591,14 @@ impl MpvSession {
 
 impl Drop for MpvSession {
     fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
-        }
+        self.kill_all();
         let _ = self.child.wait();
+        if let Some(child) = self.awake.as_mut() {
+            let _ = child.wait();
+        }
+        for player in &mut self.slots {
+            let _ = player.child.wait();
+        }
         if let Some(handle) = self.stderr_thread.take() {
             let _ = handle.join();
         }
@@ -386,12 +607,206 @@ impl Drop for MpvSession {
     }
 }
 
-fn short_socket_path() -> PathBuf {
+fn short_socket_path(index: u32) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.subsec_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("dn-{}-{nonce}.sock", std::process::id()))
+    std::env::temp_dir().join(format!("dn-{}-{nonce}-{index}.sock", std::process::id()))
+}
+
+struct SlotPlayer {
+    slot: Slot,
+    child: Child,
+    ipc: Option<std::os::unix::net::UnixStream>,
+    ipc_buf: Vec<u8>,
+    ipc_path: PathBuf,
+    pending: Vec<serde_json::Value>,
+    clips_installed: bool,
+}
+
+impl SlotPlayer {
+    fn pump(&mut self, section: &str, locked: bool, events: &mut Vec<ShowEvent>) {
+        if self.ipc.is_none() {
+            match std::os::unix::net::UnixStream::connect(&self.ipc_path) {
+                Ok(stream) => {
+                    let _ = stream.set_nonblocking(true);
+                    self.ipc = Some(stream);
+                }
+                Err(_) => return,
+            }
+        }
+        self.read(events);
+        if self.ipc.is_some() && !self.clips_installed && !section.is_empty() {
+            self.send(&serde_json::json!({
+                "command": ["define-section", "dee-nice-clips", section, "force"]
+            }));
+            if !locked {
+                self.send(&serde_json::json!({
+                    "command": ["enable-section", "dee-nice-clips"]
+                }));
+            }
+            self.send(&serde_json::json!({
+                "command": ["observe_property", 1, "user-data/dee-nice/event"]
+            }));
+            self.clips_installed = true;
+        }
+        self.flush();
+    }
+
+    fn read(&mut self, events: &mut Vec<ShowEvent>) {
+        let Some(mut stream) = self.ipc.take() else {
+            return;
+        };
+        let mut chunk = [0_u8; 4096];
+        let mut keep = true;
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => {
+                    keep = false;
+                    break;
+                }
+                Ok(count) => self.ipc_buf.extend_from_slice(&chunk[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    keep = false;
+                    break;
+                }
+            }
+            if self.ipc_buf.len() > 1_048_576 {
+                self.ipc_buf.clear();
+                break;
+            }
+        }
+        if keep {
+            self.ipc = Some(stream);
+        }
+        while let Some(split) = self.ipc_buf.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.ipc_buf.drain(..=split).collect();
+            let line = String::from_utf8_lossy(&line);
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                continue;
+            };
+            let is_event =
+                value.get("event").and_then(|event| event.as_str()) == Some("property-change");
+            if !is_event {
+                continue;
+            }
+            if value.get("name").and_then(|name| name.as_str()) != Some("user-data/dee-nice/event")
+            {
+                continue;
+            }
+            let Some(data) = value.get("data").and_then(|data| data.as_str()) else {
+                continue;
+            };
+            if let Some(event) = classify_event(data) {
+                events.push(event);
+            }
+        }
+    }
+
+    fn enqueue(&mut self, command: serde_json::Value) {
+        self.pending.push(command);
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        if self.ipc.is_none() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        for command in pending {
+            self.send(&command);
+        }
+    }
+
+    fn send(&mut self, value: &serde_json::Value) {
+        let Some(stream) = self.ipc.as_mut() else {
+            return;
+        };
+        let Ok(text) = serde_json::to_string(value) else {
+            return;
+        };
+        let _ = stream.write_all(text.as_bytes());
+        let _ = stream.write_all(b"\n");
+        let _ = stream.flush();
+    }
+}
+
+struct SlotLaunch<'a> {
+    binary: &'a Path,
+    display_name: &'a str,
+    geometry: &'a str,
+    muted: bool,
+    directory: &'a Path,
+    input_conf: &'a Path,
+    script: &'a Path,
+    index: u32,
+    slot: Slot,
+    pending: Option<serde_json::Value>,
+}
+
+fn spawn_slot(launch: &SlotLaunch<'_>) -> Result<SlotPlayer, String> {
+    let ipc_path = short_socket_path(launch.index);
+    let _ = fs::remove_file(&ipc_path);
+    let arguments = playback::slot_arguments(
+        launch.display_name,
+        launch.geometry,
+        launch.muted,
+        &ipc_path,
+        launch.input_conf,
+        launch.script,
+    );
+    let child = Command::new(launch.binary)
+        .args(arguments)
+        .current_dir(launch.directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("could not start a slot: {error}"))?;
+    Ok(SlotPlayer {
+        slot: launch.slot,
+        child,
+        ipc: None,
+        ipc_buf: Vec::new(),
+        ipc_path,
+        pending: launch.pending.clone().into_iter().collect(),
+        clips_installed: false,
+    })
+}
+
+fn awake_arguments(pid: u32) -> Vec<String> {
+    ["-d", "-i", "-s", "-w", &pid.to_string()]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Keeps the display on and blocks idle sleep until `pid` exits.
+///
+/// A missing `caffeinate` does not stop the show. Leaving display mode ends
+/// the assertion because it is tied to the player process.
+fn keep_awake(pid: u32) -> Option<Child> {
+    let binary = Path::new("/usr/bin/caffeinate");
+    if !binary.is_file() {
+        return None;
+    }
+    Command::new(binary)
+        .args(awake_arguments(pid))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+}
+
+fn action_slot(action: &BindingAction) -> Option<Slot> {
+    match action {
+        BindingAction::Play { slot, .. } | BindingAction::Black { slot } => Some(*slot),
+        BindingAction::ToggleLock | BindingAction::ExitDisplay => None,
+    }
 }
 
 fn join_both(first: JoinHandle<()>, second: JoinHandle<()>) -> JoinHandle<()> {
@@ -433,6 +848,10 @@ enum ShowEvent {
     Play(String),
 }
 
+fn auto_lock_due(locked: bool, limit: Option<Duration>, idle: Duration) -> bool {
+    limit.is_some_and(|limit| !locked && idle >= limit)
+}
+
 fn classify_event(data: &str) -> Option<ShowEvent> {
     let head = data.split(':').next()?;
     if head == "lock" {
@@ -467,6 +886,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn staying_awake_follows_the_player_until_it_exits() {
+        assert_eq!(
+            awake_arguments(42),
+            ["-d", "-i", "-s", "-w", "42"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn auto_lock_waits_until_the_idle_interval_and_stays_off_by_default() {
+        let minute = Duration::from_secs(60);
+        assert!(!auto_lock_due(false, None, minute));
+        assert!(!auto_lock_due(true, Some(minute), minute));
+        assert!(!auto_lock_due(false, Some(minute), Duration::from_secs(59)));
+        assert!(auto_lock_due(false, Some(minute), minute));
+    }
+
+    #[test]
     fn play_and_lock_events_stay_distinct() {
         assert!(matches!(classify_event("lock:3"), Some(ShowEvent::Lock)));
         match classify_event("play a:4") {
@@ -496,7 +935,7 @@ mod tests {
             assert!(text.contains(flag), "mpv is missing {flag}");
         }
 
-        let socket = short_socket_path();
+        let socket = short_socket_path(0);
         let _ = fs::remove_file(&socket);
         let mut child = Command::new(&binary)
             .args([
@@ -556,12 +995,20 @@ mod tests {
         show.set_output_display(Some(
             dee_nice_core::OutputDisplay::new(display, 0).expect("display"),
         ));
-        show.assign(dee_nice_core::Key::from_name("a").expect("a"), "red.mp4")
-            .expect("assign a");
-        show.assign(dee_nice_core::Key::from_name("b").expect("b"), "blue.mp4")
-            .expect("assign b");
+        show.assign(
+            dee_nice_core::Key::from_name("a").expect("a"),
+            "red.mp4",
+            Slot::Full,
+        )
+        .expect("assign a");
+        show.assign(
+            dee_nice_core::Key::from_name("b").expect("b"),
+            "blue.mp4",
+            Slot::Full,
+        )
+        .expect("assign b");
 
-        let mut session = MpvSession::start(&show, &BTreeMap::new()).expect("start");
+        let mut session = MpvSession::start(&show, &BTreeMap::new(), (1920, 1080)).expect("start");
         let mut connected = false;
         for _ in 0..40 {
             let _ = session.poll();

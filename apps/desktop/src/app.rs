@@ -1,9 +1,24 @@
+// Copyright (C) 2026 Matthew Butler
+//
+// dee-nice is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use dee_nice_core::{Key, OutputDisplay, Show};
+use dee_nice_core::{AUTO_LOCK_SECONDS, Key, OutputDisplay, Show, Slot, Template};
 use eframe::egui;
 
 use crate::derivatives::Library;
@@ -16,6 +31,18 @@ use crate::theme::{
     self, ASSIGNED, BACKGROUND, DROP, ERROR_FILL, ERROR_TEXT, PANEL, PRIMARY, PRIMARY_TEXT,
 };
 use crate::thumbs::Gallery;
+
+#[derive(Clone, PartialEq, Eq)]
+enum Pick {
+    Clip(String),
+    Black,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum AssignDrag {
+    Clip(String),
+    Black,
+}
 
 const KEY_ROWS: &[(&[&str], f32)] = &[
     (&["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"], 0.0),
@@ -68,7 +95,10 @@ struct DeeNiceApp {
     clips: Vec<String>,
     clips_truncated: bool,
     scan_note: Option<String>,
-    selected: Option<String>,
+    selected: Option<Pick>,
+    naming: Option<Key>,
+    name_edit: String,
+    slot: Slot,
     displays: Vec<AttachedDisplay>,
     display_error: Option<String>,
     derivatives: Library,
@@ -92,6 +122,7 @@ impl DeeNiceApp {
             machine,
         } = store::load_startup(&support_dir);
         let blocked = !save_enabled && show_path.exists();
+        let slot = show.template().slots()[0];
         let mut app = Self {
             show,
             show_path,
@@ -105,6 +136,9 @@ impl DeeNiceApp {
             clips_truncated: false,
             scan_note: None,
             selected: None,
+            naming: None,
+            name_edit: String::new(),
+            slot,
             displays: Vec::new(),
             display_error: None,
             derivatives: Library::open(support_dir.join("Derivatives")),
@@ -137,10 +171,8 @@ impl DeeNiceApp {
                 self.scan_note = Some(detail);
             }
         }
-        if self
-            .selected
-            .as_ref()
-            .is_some_and(|clip| !self.clips.iter().any(|listed| listed == clip))
+        if let Some(Pick::Clip(clip)) = &self.selected
+            && !self.clips.iter().any(|listed| listed == clip)
         {
             self.selected = None;
         }
@@ -244,6 +276,23 @@ impl DeeNiceApp {
         self.surface_derivative_notes();
     }
 
+    fn screen_size(&self) -> (u32, u32) {
+        let name = self.show.output_display().map(|display| display.name());
+        self.displays
+            .iter()
+            .find(|display| Some(display.name.as_str()) == name)
+            .map(|display| (display.point_width.max(1), display.point_height.max(1)))
+            .unwrap_or((16, 9))
+    }
+
+    fn choose_template(&mut self, template: Template) {
+        self.show.set_template(template);
+        self.slot = template.slots()[0];
+        self.notice = None;
+        self.persist_show();
+        self.push_bindings();
+    }
+
     fn chosen_pixel_edge(&self) -> Option<u32> {
         let name = self.show.output_display()?.name();
         self.displays
@@ -281,6 +330,9 @@ impl DeeNiceApp {
                 self.load_block = None;
                 self.notice = None;
                 self.selected = None;
+                self.naming = None;
+                self.name_edit.clear();
+                self.slot = self.show.template().slots()[0];
                 self.refresh_clips();
                 self.refresh_displays();
                 self.persist_show();
@@ -291,24 +343,66 @@ impl DeeNiceApp {
     }
 
     fn assign_selected(&mut self, key: Key) {
-        let Some(clip) = self.selected.clone() else {
-            self.notice = Some("Select a video first.".to_string());
+        let Some(pick) = self.selected.clone() else {
+            if self.show.assignment(key).is_some() {
+                self.select_key(key);
+            } else {
+                self.notice = Some("Select a video or Black first.".to_string());
+            }
             return;
         };
-        if self.show.clip(key) == Some(clip.as_str()) {
-            self.show.clear(key);
-        } else if let Err(error) = self.show.assign(key, &clip) {
-            self.notice = Some(error.to_string());
+        let same_slot = self
+            .show
+            .assignment(key)
+            .is_some_and(|assignment| assignment.slot() == self.slot);
+        let same = same_slot
+            && match &pick {
+                Pick::Clip(clip) => self.show.clip(key) == Some(clip.as_str()),
+                Pick::Black => self.show.is_black(key),
+            };
+        if same {
+            self.select_key(key);
             return;
         }
+        match pick {
+            Pick::Clip(clip) => {
+                if let Err(error) = self.show.assign(key, &clip, self.slot) {
+                    self.notice = Some(error.to_string());
+                    return;
+                }
+            }
+            Pick::Black => {
+                if let Err(error) = self.show.assign_black(key, self.slot) {
+                    self.notice = Some(error.to_string());
+                    return;
+                }
+            }
+        }
         self.notice = None;
+        self.select_key(key);
         self.persist_show();
         self.sync_derivatives();
         self.push_bindings();
     }
 
+    fn select_key(&mut self, key: Key) {
+        self.naming = Some(key);
+        self.name_edit = self.show.key_name(key).unwrap_or("").to_string();
+        if let Some(slot) = self
+            .show
+            .assignment(key)
+            .map(|assignment| assignment.slot())
+        {
+            self.slot = slot;
+        }
+    }
+
     fn clear_key(&mut self, key: Key) {
         self.show.clear(key);
+        if self.naming == Some(key) {
+            self.naming = None;
+            self.name_edit.clear();
+        }
         self.notice = None;
         self.persist_show();
         self.sync_derivatives();
@@ -323,7 +417,7 @@ impl DeeNiceApp {
             self.notice = Some(reason);
             return;
         }
-        match MpvSession::start(&self.show, self.derivatives.ready()) {
+        match MpvSession::start(&self.show, self.derivatives.ready(), self.screen_size()) {
             Ok(session) => {
                 self.session = Some(session);
                 self.notice = None;
@@ -452,6 +546,19 @@ impl DeeNiceApp {
                 self.show.set_start_locked(start_locked);
                 self.persist_show();
             }
+            let mut auto_lock = self.show.auto_lock_seconds().is_some();
+            if ui.checkbox(&mut auto_lock, "Auto-lock").changed() {
+                let seconds = auto_lock.then_some(AUTO_LOCK_SECONDS);
+                match self.show.set_auto_lock_seconds(seconds) {
+                    Ok(()) => {
+                        self.persist_show();
+                        if let Some(session) = self.session.as_mut() {
+                            session.set_auto_lock(self.show.auto_lock_seconds());
+                        }
+                    }
+                    Err(error) => self.notice = Some(error.to_string()),
+                }
+            }
             let mut presentation = self.machine.presentation();
             if ui.checkbox(&mut presentation, "Presentation").changed() {
                 self.machine.set_presentation(presentation);
@@ -464,18 +571,33 @@ impl DeeNiceApp {
             }
         });
         ui.weak(self.presentation_line());
+        if let Some(seconds) = self.show.auto_lock_seconds() {
+            ui.weak(format!(
+                "Auto-lock locks clip keys after {seconds} seconds with no key."
+            ));
+        }
         ui.label(self.derivative_line());
         if let Some(name) = self.derivatives.preparing() {
             ui.weak(format!("Preparing a lighter copy of {name}."));
         }
         if self.show.start_locked() {
-            match readiness::starting_clip(&self.show) {
-                Some((key, clip)) => {
-                    ui.label(format!("Display mode starts locked on {key}: {clip}"));
-                }
-                None => {
-                    ui.label("Start locked needs an assigned clip.");
-                }
+            let cues = readiness::opening_cues(&self.show);
+            if cues.is_empty() {
+                ui.label("Start locked needs an assigned key.");
+            } else {
+                let text = cues
+                    .iter()
+                    .map(|cue| {
+                        let what = cue.clip.as_deref().unwrap_or("black");
+                        if self.show.template().is_full() {
+                            format!("{}: {what}", cue.label)
+                        } else {
+                            format!("{} {}: {what}", cue.slot.label(), cue.label)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.label(format!("Display mode starts locked on {text}"));
             }
         }
         if self.session.is_some() {
@@ -501,7 +623,7 @@ impl DeeNiceApp {
                 }
             });
         }
-        ui.label("Drag a video onto a key. Click a key to assign the selected video. Right-click a key to clear it.");
+        ui.label("Drag a video or Black onto a key. Click a key to assign the selection. Right-click a key to clear it.");
         ui.label("Ctrl+Shift+L locks switching. Ctrl+Shift+K leaves display mode.");
     }
 
@@ -511,23 +633,40 @@ impl DeeNiceApp {
             .output_display()
             .map(|display| display.name().to_string())
             .unwrap_or_else(|| "the chosen display".to_string());
-        let live = self
-            .session
-            .as_ref()
-            .and_then(|session| session.live_key())
-            .map(str::to_string);
         let locked = self
             .session
             .as_ref()
             .is_some_and(|session| session.is_locked());
+        let names = self
+            .session
+            .as_ref()
+            .map(|session| {
+                session
+                    .live_names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         ui.label(format!("Playing on {display}."));
-        if let Some(name) = live.as_deref() {
-            let label = Key::from_name(name)
-                .map(|key| key.label())
-                .unwrap_or_else(|| name.to_string());
-            ui.label(format!("Live: {label}"));
-        } else {
+        if names.is_empty() {
             ui.label("Waiting for a key.");
+        } else {
+            let labels = names
+                .iter()
+                .map(|name| {
+                    Key::from_name(name)
+                        .map(|key| {
+                            self.show
+                                .key_name(key)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| key.label())
+                        })
+                        .unwrap_or_else(|| name.clone())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            ui.label(format!("Live: {labels}"));
         }
         ui.horizontal(|ui| {
             let lock_label = if locked { "Unlock keys" } else { "Lock keys" };
@@ -576,7 +715,7 @@ impl DeeNiceApp {
         if let Some(note) = &self.scan_note {
             ui.colored_label(ERROR_TEXT, note);
         }
-        if self.clips.is_empty() {
+        if !self.save_enabled && self.clips.is_empty() {
             ui.label("Choose a folder of videos.");
             return;
         }
@@ -585,10 +724,14 @@ impl DeeNiceApp {
         }
         let clips = self.clips.clone();
         let mut pick = None;
+        let mut pick_black = false;
         egui::ScrollArea::vertical()
             .id_salt("videos")
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
+                    if self.black_card(ui) {
+                        pick_black = true;
+                    }
                     for clip in &clips {
                         if self.video_card(ui, clip) {
                             pick = Some(clip.clone());
@@ -596,19 +739,41 @@ impl DeeNiceApp {
                     }
                 });
             });
-        if let Some(clip) = pick {
-            self.selected = Some(clip);
+        if pick_black {
+            self.selected = Some(Pick::Black);
+        } else if let Some(clip) = pick {
+            self.selected = Some(Pick::Clip(clip));
         }
+    }
+
+    fn black_card(&mut self, ui: &mut egui::Ui) -> bool {
+        let id = ui.make_persistent_id("black-card");
+        let selected = self.selected == Some(Pick::Black);
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(148.0, 112.0), egui::Sense::click_and_drag());
+        if response.dragged() {
+            response.dnd_set_drag_payload(AssignDrag::Black);
+            if let Some(pointer) = ui.ctx().pointer_interact_pos() {
+                let layer = egui::LayerId::new(egui::Order::Tooltip, id);
+                let preview = egui::Rect::from_center_size(pointer, rect.size());
+                paint_black_card(&ui.ctx().layer_painter(layer), preview, true);
+            }
+        }
+        paint_black_card(ui.painter(), rect, selected);
+        response
+            .on_hover_cursor(egui::CursorIcon::Grab)
+            .on_hover_text("Cut to black")
+            .clicked()
     }
 
     fn video_card(&mut self, ui: &mut egui::Ui, clip: &str) -> bool {
         let id = ui.make_persistent_id(("video", clip));
         let texture = self.texture_for(ui.ctx(), clip);
-        let selected = self.selected.as_deref() == Some(clip);
+        let selected = self.selected == Some(Pick::Clip(clip.to_string()));
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(148.0, 112.0), egui::Sense::click_and_drag());
         if response.dragged() {
-            response.dnd_set_drag_payload(clip.to_string());
+            response.dnd_set_drag_payload(AssignDrag::Clip(clip.to_string()));
             self.paint_drag_preview(ui, id, rect, texture.as_ref(), clip);
         }
         paint_card(ui.painter(), rect, clip, texture.as_ref(), selected, false);
@@ -643,8 +808,75 @@ impl DeeNiceApp {
 
     fn key_column(&mut self, ui: &mut egui::Ui) {
         ui.heading("Keyboard");
-        let selected = self.selected.as_deref().unwrap_or("none");
+        let playing = self.session.is_some();
+        let mut chosen_template = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Layout");
+            for template in Template::ALL {
+                let selected = self.show.template() == template;
+                if ui
+                    .add_enabled(
+                        !playing,
+                        egui::Button::selectable(selected, template.label()),
+                    )
+                    .clicked()
+                {
+                    chosen_template = Some(template);
+                }
+            }
+        });
+        if let Some(template) = chosen_template {
+            self.choose_template(template);
+        }
+        if self.show.template().slots().len() > 1 {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Slot");
+                for slot in self.show.template().slots() {
+                    if ui
+                        .selectable_label(self.slot == *slot, slot.label())
+                        .clicked()
+                    {
+                        self.slot = *slot;
+                    }
+                }
+            });
+            ui.weak("A key cuts only its slot. The other slots keep playing.");
+        }
+        let selected = match &self.selected {
+            Some(Pick::Clip(clip)) => clip.clone(),
+            Some(Pick::Black) => "Black".to_string(),
+            None => "none".to_string(),
+        };
         ui.weak(format!("Selected: {selected}"));
+        let can_name = self
+            .naming
+            .is_some_and(|key| self.show.assignment(key).is_some());
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            let response = ui.add_enabled(
+                can_name,
+                egui::TextEdit::singleline(&mut self.name_edit)
+                    .hint_text("Doorway")
+                    .char_limit(24)
+                    .desired_width(220.0)
+                    .id_salt("key-name"),
+            );
+            if response.changed()
+                && let Some(key) = self.naming
+            {
+                match self.show.set_key_name(key, &self.name_edit) {
+                    Ok(()) => {
+                        self.name_edit = self.show.key_name(key).unwrap_or("").to_string();
+                        self.notice = None;
+                        self.persist_show();
+                    }
+                    Err(error) => {
+                        self.name_edit = self.show.key_name(key).unwrap_or("").to_string();
+                        self.notice = Some(error.to_string());
+                    }
+                }
+            }
+        });
         egui::ScrollArea::vertical().id_salt("keys").show(ui, |ui| {
             for (row, indent) in KEY_ROWS {
                 ui.horizontal(|ui| {
@@ -663,16 +895,24 @@ impl DeeNiceApp {
         let Some(key) = Key::from_name(name) else {
             return;
         };
-        let assigned = self.show.clip(key).map(str::to_string);
-        let texture = assigned
+        let assigned_clip = self.show.clip(key).map(str::to_string);
+        let black = self.show.is_black(key);
+        let key_name = self.show.key_name(key).map(str::to_string);
+        let assigned = assigned_clip.is_some() || black;
+        let texture = assigned_clip
             .as_deref()
             .and_then(|clip| self.texture_for(ui.ctx(), clip));
         let (rect, response) = ui.allocate_exact_size(theme::KEY_SIZE, egui::Sense::click());
-        let live = self.session.as_ref().and_then(|session| session.live_key()) == Some(name);
-        let drag_hot = response.dnd_hover_payload::<String>().is_some();
+        let live = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.is_live(name));
+        let drag_hot = response.dnd_hover_payload::<AssignDrag>().is_some();
         let fill = if drag_hot {
             DROP
-        } else if assigned.is_some() {
+        } else if black {
+            egui::Color32::from_rgb(12, 12, 14)
+        } else if assigned {
             ASSIGNED
         } else {
             PANEL
@@ -699,12 +939,12 @@ impl DeeNiceApp {
                 egui::Color32::WHITE,
             );
         }
-        let letter_pos = if assigned.is_some() {
+        let letter_pos = if assigned {
             rect.left_top() + egui::vec2(14.0, 12.0)
         } else {
             rect.center()
         };
-        if assigned.is_some() {
+        if assigned {
             painter.rect_filled(
                 egui::Rect::from_center_size(letter_pos, egui::vec2(22.0, 16.0)),
                 egui::CornerRadius::same(3),
@@ -715,14 +955,56 @@ impl DeeNiceApp {
             letter_pos,
             egui::Align2::CENTER_CENTER,
             key.label(),
-            egui::FontId::proportional(if assigned.is_some() { 12.0 } else { 18.0 }),
+            egui::FontId::proportional(if assigned { 12.0 } else { 18.0 }),
             PRIMARY,
         );
-        if let Some(clip) = &assigned {
-            response.clone().on_hover_text(clip);
+        let mark = self
+            .show
+            .assignment(key)
+            .map(|assignment| assignment.slot().mark())
+            .unwrap_or("");
+        if !mark.is_empty() {
+            painter.text(
+                rect.right_top() + egui::vec2(-8.0, 10.0),
+                egui::Align2::RIGHT_CENTER,
+                mark,
+                egui::FontId::proportional(10.0),
+                PRIMARY,
+            );
         }
-        if let Some(clip) = response.dnd_release_payload::<String>() {
-            self.assign_clip(key, clip.as_str());
+        if let Some(name) = &key_name {
+            let bar = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 3.0, rect.bottom() - 16.0),
+                rect.right_bottom() - egui::vec2(3.0, 3.0),
+            );
+            painter.rect_filled(
+                bar,
+                egui::CornerRadius::same(3),
+                egui::Color32::from_black_alpha(190),
+            );
+            painter.text(
+                bar.center(),
+                egui::Align2::CENTER_CENTER,
+                name,
+                egui::FontId::proportional(11.0),
+                PRIMARY,
+            );
+        }
+        let hover = match (key_name.as_deref(), assigned_clip.as_deref(), black) {
+            (Some(name), Some(clip), _) => format!("{name}\n{clip}"),
+            (None, Some(clip), _) => clip.to_string(),
+            (Some(name), None, true) => format!("{name}\nBlack"),
+            (None, None, true) => "Black".to_string(),
+            _ => String::new(),
+        };
+        if !hover.is_empty() {
+            response.clone().on_hover_text(hover);
+        }
+        if let Some(drag) = response.dnd_release_payload::<AssignDrag>() {
+            match drag.as_ref() {
+                AssignDrag::Clip(clip) => self.assign_clip(key, clip),
+                AssignDrag::Black => self.assign_black(key),
+            }
         } else if response.clicked() {
             self.assign_selected(key);
         } else if response.secondary_clicked() {
@@ -731,12 +1013,26 @@ impl DeeNiceApp {
     }
 
     fn assign_clip(&mut self, key: Key, clip: &str) {
-        if let Err(error) = self.show.assign(key, clip) {
+        if let Err(error) = self.show.assign(key, clip, self.slot) {
             self.notice = Some(error.to_string());
             return;
         }
-        self.selected = Some(clip.to_string());
+        self.selected = Some(Pick::Clip(clip.to_string()));
         self.notice = None;
+        self.select_key(key);
+        self.persist_show();
+        self.sync_derivatives();
+        self.push_bindings();
+    }
+
+    fn assign_black(&mut self, key: Key) {
+        if let Err(error) = self.show.assign_black(key, self.slot) {
+            self.notice = Some(error.to_string());
+            return;
+        }
+        self.selected = Some(Pick::Black);
+        self.notice = None;
+        self.select_key(key);
         self.persist_show();
         self.sync_derivatives();
         self.push_bindings();
@@ -849,6 +1145,32 @@ fn error_banner(ui: &mut egui::Ui, message: &str) {
         .show(ui, |ui| {
             ui.label(egui::RichText::new(message).color(ERROR_TEXT));
         });
+}
+
+fn paint_black_card(painter: &egui::Painter, rect: egui::Rect, selected: bool) {
+    let stroke = if selected {
+        egui::Stroke::new(2.0, PRIMARY)
+    } else {
+        egui::Stroke::new(1.0, egui::Color32::from_gray(55))
+    };
+    painter.rect_filled(
+        rect,
+        egui::CornerRadius::same(6),
+        egui::Color32::from_rgb(8, 8, 10),
+    );
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(6),
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "Black",
+        egui::FontId::proportional(16.0),
+        PRIMARY,
+    );
 }
 
 fn paint_card(

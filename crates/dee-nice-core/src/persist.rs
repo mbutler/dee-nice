@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Matthew Butler
+//
+// dee-nice is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 use std::fs::{self, File};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -5,9 +20,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ShowError;
-use crate::show::{OutputDisplay, Show};
+use crate::show::{OutputDisplay, Show, Slot, Template};
 
-pub const SHOW_SCHEMA_VERSION: u32 = 2;
+pub const SHOW_SCHEMA_VERSION: u32 = 4;
+const SCHEMA_THREE: u32 = 3;
+const SCHEMA_TWO: u32 = 2;
 const LEGACY_SCHEMA_VERSION: u32 = 1;
 const MAX_SHOW_BYTES: u64 = 1024 * 1024;
 
@@ -20,7 +37,30 @@ pub fn portable_show_path(media_directory: &Path) -> PathBuf {
 #[serde(deny_unknown_fields)]
 struct PortableShow {
     schema_version: u32,
+    template: String,
     assignments: Vec<FileAssignment>,
+    muted: bool,
+    start_locked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_lock_seconds: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaThreeShow {
+    schema_version: u32,
+    assignments: Vec<FileAssignment>,
+    muted: bool,
+    start_locked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auto_lock_seconds: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaTwoShow {
+    schema_version: u32,
+    assignments: Vec<LegacyAssignment>,
     muted: bool,
     start_locked: bool,
 }
@@ -30,7 +70,7 @@ struct PortableShow {
 struct LegacyShow {
     schema_version: u32,
     media_directory: String,
-    assignments: Vec<FileAssignment>,
+    assignments: Vec<LegacyAssignment>,
     muted: bool,
     start_locked: bool,
     output_display: Option<FileOutputDisplay>,
@@ -40,7 +80,29 @@ struct LegacyShow {
 #[serde(deny_unknown_fields)]
 struct FileAssignment {
     key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    clip: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    black: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default = "full_slot")]
+    slot: String,
+}
+
+fn full_slot() -> String {
+    Slot::Full.name().to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyAssignment {
+    key: String,
     clip: String,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -50,11 +112,11 @@ struct FileOutputDisplay {
     index: u32,
 }
 
-/// Writes a schema-2 show to a temporary file beside `path`, then replaces `path`.
+/// Writes a schema-3 show to a temporary file beside `path`, then replaces `path`.
 ///
-/// The file stores the key map, mute, and start locked. The media directory and
-/// the display stay out of the file. A failed write leaves an existing show
-/// file in place.
+/// The file stores the key map, names, black keys, mute, start locked, and
+/// auto-lock. The media directory and the display stay out of the file. A
+/// failed write leaves an existing show file in place.
 pub fn save_show(path: &Path, show: &Show) -> Result<(), ShowError> {
     let bytes = serialize_show(show).map_err(|error| match error {
         ShowError::SaveFailed { detail, .. } => ShowError::SaveFailed {
@@ -66,9 +128,10 @@ pub fn save_show(path: &Path, show: &Show) -> Result<(), ShowError> {
     atomic_write(path, &bytes)
 }
 
-/// Loads a show file. Schema 2 is the portable file inside `.dee-nice`. Schema
-/// 1 is the older file that still carries a directory and a display. Any other
-/// schema is rejected before its fields are interpreted.
+/// Loads a show file. Schema 3 is the current portable file inside `.dee-nice`.
+/// Schema 2 is the previous portable file, and schema 1 is the older file that
+/// still carries a directory and a display. Any other schema is rejected
+/// before its fields are interpreted.
 pub fn load_show(path: &Path) -> Result<Show, ShowError> {
     let file = File::open(path).map_err(|error| ShowError::LoadFailed {
         path: path.to_path_buf(),
@@ -108,6 +171,22 @@ pub fn load_show(path: &Path) -> Result<Show, ShowError> {
                 })?;
             file_show.into_show(path)
         }
+        SCHEMA_THREE => {
+            let file_show: SchemaThreeShow =
+                serde_json::from_value(value).map_err(|error| ShowError::InvalidShowFile {
+                    path: path.to_path_buf(),
+                    detail: error.to_string(),
+                })?;
+            file_show.into_show(path)
+        }
+        SCHEMA_TWO => {
+            let file_show: SchemaTwoShow =
+                serde_json::from_value(value).map_err(|error| ShowError::InvalidShowFile {
+                    path: path.to_path_buf(),
+                    detail: error.to_string(),
+                })?;
+            file_show.into_show(path)
+        }
         SHOW_SCHEMA_VERSION => {
             let file_show: PortableShow =
                 serde_json::from_value(value).map_err(|error| ShowError::InvalidShowFile {
@@ -136,22 +215,29 @@ fn serialize_show(show: &Show) -> Result<Vec<u8>, ShowError> {
         assignments,
         muted,
         start_locked,
+        auto_lock_seconds,
+        template,
         output_display: _,
     } = show;
     let mut pairs: Vec<_> = assignments.iter().collect();
     pairs.sort_by_key(|(left, _)| left.name());
     let assignments = pairs
         .into_iter()
-        .map(|(key, clip)| FileAssignment {
+        .map(|(key, assignment)| FileAssignment {
             key: key.name(),
-            clip: clip.clone(),
+            clip: assignment.clip().map(str::to_string),
+            black: assignment.is_black(),
+            name: assignment.name().map(str::to_string),
+            slot: assignment.slot().name().to_string(),
         })
         .collect();
     let file_show = PortableShow {
         schema_version: SHOW_SCHEMA_VERSION,
+        template: template.name().to_string(),
         assignments,
         muted: *muted,
         start_locked: *start_locked,
+        auto_lock_seconds: *auto_lock_seconds,
     };
     let mut bytes =
         serde_json::to_vec_pretty(&file_show).map_err(|error| ShowError::SaveFailed {
@@ -162,31 +248,87 @@ fn serialize_show(show: &Show) -> Result<Vec<u8>, ShowError> {
     Ok(bytes)
 }
 
+fn apply_legacy_assignments(
+    show: &mut Show,
+    path: &Path,
+    assignments: Vec<LegacyAssignment>,
+) -> Result<(), ShowError> {
+    for LegacyAssignment { key, clip } in assignments {
+        let key = parse_key(path, &key)?;
+        if show.assignment(key).is_some() {
+            return Err(duplicate_key(path, key));
+        }
+        show.assign(key, &clip, Slot::Full)
+            .map_err(|error| invalid_show(path, error.to_string()))?;
+    }
+    Ok(())
+}
+
 fn apply_assignments(
     show: &mut Show,
     path: &Path,
     assignments: Vec<FileAssignment>,
 ) -> Result<(), ShowError> {
-    for FileAssignment { key, clip } in assignments {
-        let Some(key) = crate::show::Key::from_name(&key) else {
-            return Err(ShowError::InvalidShowFile {
-                path: path.to_path_buf(),
-                detail: format!("unknown key \"{key}\""),
-            });
-        };
-        if show.clip(key).is_some() {
-            return Err(ShowError::InvalidShowFile {
-                path: path.to_path_buf(),
-                detail: format!("key \"{}\" is assigned more than once", key.name()),
-            });
+    for FileAssignment {
+        key,
+        clip,
+        black,
+        name,
+        slot,
+    } in assignments
+    {
+        let key = parse_key(path, &key)?;
+        if show.assignment(key).is_some() {
+            return Err(duplicate_key(path, key));
         }
-        show.assign(key, &clip)
-            .map_err(|error| ShowError::InvalidShowFile {
-                path: path.to_path_buf(),
-                detail: error.to_string(),
-            })?;
+        let Some(slot) = Slot::from_name(&slot) else {
+            return Err(invalid_show(path, format!("unknown slot \"{slot}\"")));
+        };
+        match (black, clip) {
+            (true, None) => show
+                .assign_black(key, slot)
+                .map_err(|error| invalid_show(path, error.to_string()))?,
+            (false, Some(clip)) => show
+                .assign(key, &clip, slot)
+                .map_err(|error| invalid_show(path, error.to_string()))?,
+            (true, Some(_)) => {
+                return Err(invalid_show(
+                    path,
+                    format!("key \"{}\" has both a clip and black", key.name()),
+                ));
+            }
+            (false, None) => {
+                return Err(invalid_show(
+                    path,
+                    format!("key \"{}\" has no clip", key.name()),
+                ));
+            }
+        }
+        if let Some(name) = name {
+            show.set_key_name(key, &name)
+                .map_err(|error| invalid_show(path, error.to_string()))?;
+        }
     }
     Ok(())
+}
+
+fn parse_key(path: &Path, key: &str) -> Result<crate::show::Key, ShowError> {
+    crate::show::Key::from_name(key)
+        .ok_or_else(|| invalid_show(path, format!("unknown key \"{key}\"")))
+}
+
+fn duplicate_key(path: &Path, key: crate::show::Key) -> ShowError {
+    invalid_show(
+        path,
+        format!("key \"{}\" is assigned more than once", key.name()),
+    )
+}
+
+fn invalid_show(path: &Path, detail: String) -> ShowError {
+    ShowError::InvalidShowFile {
+        path: path.to_path_buf(),
+        detail,
+    }
 }
 
 fn portable_media_directory(path: &Path) -> Result<PathBuf, String> {
@@ -206,29 +348,82 @@ impl PortableShow {
     fn into_show(self, path: &Path) -> Result<Show, ShowError> {
         let PortableShow {
             schema_version,
+            template,
             assignments,
             muted,
             start_locked,
+            auto_lock_seconds,
         } = self;
         if schema_version != SHOW_SCHEMA_VERSION {
             return Err(ShowError::UnsupportedSchema {
                 found: schema_version,
             });
         }
-        let media_directory =
-            portable_media_directory(path).map_err(|detail| ShowError::InvalidShowFile {
-                path: path.to_path_buf(),
-                detail,
-            })?;
-        let mut show = Show::new(media_directory).map_err(|error| ShowError::InvalidShowFile {
-            path: path.to_path_buf(),
-            detail: error.to_string(),
-        })?;
-        show.set_muted(muted);
-        show.set_start_locked(start_locked);
+        let mut show = portable_show(path, muted, start_locked)?;
+        let Some(template) = Template::from_name(&template) else {
+            return Err(invalid_show(path, format!("unknown layout \"{template}\"")));
+        };
+        show.set_template(template);
         apply_assignments(&mut show, path, assignments)?;
+        if let Some(seconds) = auto_lock_seconds {
+            show.set_auto_lock_seconds(Some(seconds))
+                .map_err(|error| invalid_show(path, error.to_string()))?;
+        }
         Ok(show)
     }
+}
+
+impl SchemaThreeShow {
+    fn into_show(self, path: &Path) -> Result<Show, ShowError> {
+        let SchemaThreeShow {
+            schema_version,
+            assignments,
+            muted,
+            start_locked,
+            auto_lock_seconds,
+        } = self;
+        if schema_version != SCHEMA_THREE {
+            return Err(ShowError::UnsupportedSchema {
+                found: schema_version,
+            });
+        }
+        let mut show = portable_show(path, muted, start_locked)?;
+        apply_assignments(&mut show, path, assignments)?;
+        if let Some(seconds) = auto_lock_seconds {
+            show.set_auto_lock_seconds(Some(seconds))
+                .map_err(|error| invalid_show(path, error.to_string()))?;
+        }
+        Ok(show)
+    }
+}
+
+impl SchemaTwoShow {
+    fn into_show(self, path: &Path) -> Result<Show, ShowError> {
+        let SchemaTwoShow {
+            schema_version,
+            assignments,
+            muted,
+            start_locked,
+        } = self;
+        if schema_version != SCHEMA_TWO {
+            return Err(ShowError::UnsupportedSchema {
+                found: schema_version,
+            });
+        }
+        let mut show = portable_show(path, muted, start_locked)?;
+        apply_legacy_assignments(&mut show, path, assignments)?;
+        Ok(show)
+    }
+}
+
+fn portable_show(path: &Path, muted: bool, start_locked: bool) -> Result<Show, ShowError> {
+    let media_directory =
+        portable_media_directory(path).map_err(|detail| invalid_show(path, detail))?;
+    let mut show =
+        Show::new(media_directory).map_err(|error| invalid_show(path, error.to_string()))?;
+    show.set_muted(muted);
+    show.set_start_locked(start_locked);
+    Ok(show)
 }
 
 impl LegacyShow {
@@ -260,7 +455,7 @@ impl LegacyShow {
                 })?;
             show.set_output_display(Some(display));
         }
-        apply_assignments(&mut show, path, assignments)?;
+        apply_legacy_assignments(&mut show, path, assignments)?;
         Ok(show)
     }
 }
@@ -343,8 +538,9 @@ mod tests {
 
     fn sample(directory: &Path) -> Show {
         let mut show = Show::new(directory).unwrap();
-        show.assign(Key::from_name("b").unwrap(), "b.mp4").unwrap();
-        show.assign(Key::from_name("a").unwrap(), "loops/a.mp4")
+        show.assign(Key::from_name("b").unwrap(), "b.mp4", Slot::Full)
+            .unwrap();
+        show.assign(Key::from_name("a").unwrap(), "loops/a.mp4", Slot::Full)
             .unwrap();
         show.set_muted(true);
         show.set_start_locked(true);
@@ -379,7 +575,10 @@ mod tests {
         let b = text.find("\"key\": \"b\"").unwrap();
         assert!(a < b, "assignments are stored by key name");
         assert!(text.ends_with('\n'));
-        assert!(text.contains("\"schema_version\": 2"));
+        assert!(text.contains("\"schema_version\": 4"));
+        assert!(text.contains("\"template\": \"full\""));
+        assert!(!text.contains("auto_lock_seconds"));
+        assert!(!text.contains("\"black\""));
         assert!(!text.contains("media_directory"));
         assert!(!text.contains("output_display"));
     }
@@ -425,11 +624,11 @@ mod tests {
         save_show(&path, &sample(dir.path())).unwrap();
         let mut value: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        value["schema_version"] = serde_json::json!(3);
+        value["schema_version"] = serde_json::json!(5);
         value["future_field"] = serde_json::json!(true);
         fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
         let error = load_show(&path).unwrap_err();
-        assert!(matches!(error, ShowError::UnsupportedSchema { found: 3 }));
+        assert!(matches!(error, ShowError::UnsupportedSchema { found: 5 }));
     }
 
     #[test]
@@ -501,6 +700,55 @@ mod tests {
                 Err(ShowError::InvalidShowFile { .. })
             ));
         }
+    }
+
+    #[test]
+    fn schema_2_opens_and_names_black_and_auto_lock_round_trip() {
+        let dir = TempDir::new();
+        let path = show_file(dir.path());
+        let schema_two = r#"{
+  "schema_version": 2,
+  "assignments": [{"key": "a", "clip": "a.mp4"}],
+  "muted": false,
+  "start_locked": false
+}
+"#;
+        fs::write(&path, schema_two).unwrap();
+        let loaded = load_show(&path).unwrap();
+        assert_eq!(loaded.clip(Key::from_name("a").unwrap()), Some("a.mp4"));
+        assert!(loaded.auto_lock_seconds().is_none());
+        assert!(loaded.key_name(Key::from_name("a").unwrap()).is_none());
+
+        let mut show = sample(dir.path());
+        show.assign_black(Key::from_name("z").unwrap(), Slot::Full)
+            .unwrap();
+        show.set_key_name(Key::from_name("z").unwrap(), "Hold")
+            .unwrap();
+        show.set_key_name(Key::from_name("a").unwrap(), "Doorway")
+            .unwrap();
+        show.set_auto_lock_seconds(Some(crate::show::AUTO_LOCK_SECONDS))
+            .unwrap();
+        save_show(&path, &show).unwrap();
+        let again = load_show(&path).unwrap();
+        assert!(again.is_black(Key::from_name("z").unwrap()));
+        assert_eq!(again.key_name(Key::from_name("z").unwrap()), Some("Hold"));
+        assert_eq!(
+            again.key_name(Key::from_name("a").unwrap()),
+            Some("Doorway")
+        );
+        assert_eq!(
+            again.auto_lock_seconds(),
+            Some(crate::show::AUTO_LOCK_SECONDS)
+        );
+        assert_eq!(
+            again.clip(Key::from_name("a").unwrap()),
+            Some("loops/a.mp4")
+        );
+
+        let text = fs::read_to_string(&path).unwrap();
+        let broken = text.replace("\"black\": true", "\"black\": true, \"clip\": \"nope.mp4\"");
+        fs::write(&path, broken).unwrap();
+        assert!(load_show(&path).is_err());
     }
 
     #[test]

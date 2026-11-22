@@ -1,3 +1,18 @@
+// Copyright (C) 2026 Matthew Butler
+//
+// dee-nice is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
 use dee_nice_core::{BindingAction, Show};
 
 use crate::media;
@@ -21,16 +36,15 @@ pub fn readiness(show: &Show, connected_names: &[String]) -> Result<(), String> 
         ));
     }
     let mut missing = Vec::new();
-    let mut assigned = 0;
-    for (key, clip) in show.assignments() {
-        assigned += 1;
+    let assigned = show.assignments().count();
+    for (key, clip) in show.clips() {
         if let Err(error) = media::resolve_clip(directory, clip) {
             missing.push(format!("{} ({})", clip, key.label()));
             let _ = error;
         }
     }
     if assigned == 0 {
-        return Err("Assign at least one video to a key.".to_string());
+        return Err("Assign at least one key.".to_string());
     }
     if !missing.is_empty() {
         return Err(format!(
@@ -54,25 +68,49 @@ pub fn forget_missing_display(show: &mut Show, connected_names: &[String]) {
     }
 }
 
-pub fn starting_clip(show: &Show) -> Option<(String, String)> {
+pub struct OpeningCue {
+    pub label: String,
+    pub key_name: String,
+    /// `None` starts on black.
+    pub clip: Option<String>,
+    pub slot: dee_nice_core::Slot,
+}
+
+/// The first assignment in each slot, in key order, when the show starts locked.
+pub fn opening_cues(show: &Show) -> Vec<OpeningCue> {
     if !show.start_locked() {
-        return None;
+        return Vec::new();
     }
+    let mut seen = std::collections::BTreeSet::new();
     show.playback_bindings(false)
         .into_iter()
-        .find_map(|binding| {
-            let BindingAction::Play { clip } = binding.action else {
-                return None;
+        .filter_map(|binding| {
+            let label = binding.chord.key().label();
+            let key_name = binding.chord.key().name();
+            let cue = match binding.action {
+                BindingAction::Play { clip, slot } => OpeningCue {
+                    label,
+                    key_name,
+                    clip: Some(clip),
+                    slot,
+                },
+                BindingAction::Black { slot } => OpeningCue {
+                    label,
+                    key_name,
+                    clip: None,
+                    slot,
+                },
+                BindingAction::ToggleLock | BindingAction::ExitDisplay => return None,
             };
-            let key = binding.chord.key().label();
-            Some((key, clip))
+            seen.insert(cue.slot).then_some(cue)
         })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dee_nice_core::{Key, OutputDisplay, Show};
+    use dee_nice_core::{Key, OutputDisplay, Show, Slot};
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
@@ -123,10 +161,10 @@ mod tests {
                 .unwrap_err()
                 .contains("at least one")
         );
-        show.assign(key("b"), "b.mp4").unwrap();
+        show.assign(key("b"), "b.mp4", Slot::Full).unwrap();
         assert!(readiness(&show, &displays).unwrap_err().contains("b.mp4"));
         show.clear(key("b"));
-        show.assign(key("a"), "a.mp4").unwrap();
+        show.assign(key("a"), "a.mp4", Slot::Full).unwrap();
         assert!(readiness(&show, &displays).is_ok());
         assert!(
             readiness(&show, &["Other".to_string()])
@@ -145,12 +183,16 @@ mod tests {
     #[test]
     fn start_locked_names_the_first_assigned_clip() {
         let mut show = Show::new(Path::new("/shows/opening")).unwrap();
-        show.assign(key("b"), "b.mp4").unwrap();
-        show.assign(key("a"), "a.mp4").unwrap();
-        assert!(starting_clip(&show).is_none());
+        show.assign(key("b"), "b.mp4", Slot::Full).unwrap();
+        show.assign(key("a"), "a.mp4", Slot::Full).unwrap();
+        assert!(opening_cues(&show).is_empty());
         show.set_start_locked(true);
-        let (label, clip) = starting_clip(&show).unwrap();
-        assert_eq!(label, "A");
-        assert_eq!(clip, "a.mp4");
+        let cue = opening_cues(&show).into_iter().next().unwrap();
+        assert_eq!(cue.label, "A");
+        assert_eq!(cue.clip.as_deref(), Some("a.mp4"));
+        show.assign_black(key("a"), Slot::Full).unwrap();
+        let black = opening_cues(&show).into_iter().next().unwrap();
+        assert_eq!(black.key_name, "a");
+        assert!(black.clip.is_none());
     }
 }

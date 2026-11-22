@@ -1,0 +1,17 @@
+dee-nice runs two separate programs. They are not linked into the dee-nice binary.
+
+mpv
+Copyright © 2000-2026 mpv/MPlayer/mplayer2 projects
+Licensed under the GNU General Public License, version 2 or any later version.
+https://mpv.io/
+Source: https://github.com/mpv-player/mpv
+
+ffmpeg
+Copyright (c) 2000-2026 the FFmpeg developers
+The macOS build shipped with dee-nice is configured with --enable-gpl,
+--enable-version3, and libx264, so that build is under the GNU General
+Public License, version 3 or any later version.
+https://ffmpeg.org/
+Source: https://git.ffmpeg.org/ffmpeg.git
+
+Libraries copied beside ffmpeg keep the licenses of their own projects.
