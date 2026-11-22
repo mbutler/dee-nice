@@ -4,7 +4,7 @@ Current milestone: assign clips to keys, choose a display, and play one looping 
 
 Active task: none. Tasks 001 and 002 are done. The show file lives in the video folder, assigned clips that do not fit this Mac get a lighter copy outside that folder, and `scripts/bundle-macos.sh` builds one `dee-nice.app`. dee-nice is GPL-3.0-or-later. The next slice is notarization before that app is handed to anyone.
 
-Checkpoint: `965b0b4` on `main`, plus uncommitted work since that commit, including the GPL-3.0-or-later license.
+Checkpoint: `d0bc351` on `main`. `dist/dee-nice.dmg` is the download and is not committed.
 
 ## Working behavior
 
