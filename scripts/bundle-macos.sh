@@ -45,6 +45,7 @@ mkdir -p "$macos" "$lib_dir" "$resources"
 cp "$root/target/release/dee-nice" "$macos/dee-nice"
 cp "$root/LICENSE" "$resources/LICENSE"
 cp "$root/THIRD-PARTY-NOTICES" "$resources/THIRD-PARTY-NOTICES"
+cp "$root/apps/desktop/assets/AppIcon.icns" "$resources/AppIcon.icns"
 chmod +x "$macos/dee-nice"
 ditto "$mpv_app" "$macos/mpv.app"
 cp "$ffmpeg_bin" "$macos/ffmpeg"
@@ -95,6 +96,8 @@ cat > "$out/Contents/Info.plist" <<'EOF'
   <string>dee-nice</string>
   <key>CFBundleExecutable</key>
   <string>dee-nice</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>app.dee-nice</string>
   <key>CFBundleInfoDictionaryVersion</key>

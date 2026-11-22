@@ -4,7 +4,7 @@ Current milestone: assign clips to keys, choose a display, and play one looping 
 
 Active task: none. Tasks 001 and 002 are done. The show file lives in the video folder, assigned clips that do not fit this Mac get a lighter copy outside that folder, and `scripts/bundle-macos.sh` builds one `dee-nice.app`. dee-nice is GPL-3.0-or-later. The next slice is notarization before that app is handed to anyone.
 
-Checkpoint: `1994a15` on `main`. Release [v0.1.0](https://github.com/mbutler/dee-nice/releases/tag/v0.1.0) publishes `dee-nice.dmg`. The disk image is not committed.
+Checkpoint: `1994a15` on `main`. Release [v0.1.0](https://github.com/mbutler/dee-nice/releases/tag/v0.1.0) publishes `dee-nice.dmg`. That published image has no app icon. The bundle script now copies `AppIcon.icns`, the eframe mark already used in the Dock.
 
 ## Working behavior
 

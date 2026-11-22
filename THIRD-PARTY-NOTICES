@@ -15,3 +15,9 @@ https://ffmpeg.org/
 Source: https://git.ffmpeg.org/ffmpeg.git
 
 Libraries copied beside ffmpeg keep the licenses of their own projects.
+
+App icon
+The Dock and Finder icon is the eframe icon from eframe 0.37.0.
+Copyright Emil Ernerfeldt and the egui contributors.
+Licensed under MIT OR Apache-2.0.
+https://github.com/emilk/egui

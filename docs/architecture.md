@@ -68,6 +68,6 @@ While display mode is running, the shell starts `caffeinate` against the mpv pro
 
 Monitor enumeration and the folder scan stay in the shell. The core stores the operator's choice and the relative paths.
 
-The shipping app is a macOS bundle, built by `scripts/bundle-macos.sh` into `dist/dee-nice.app`. Finder shows one icon. Inside `Contents/MacOS`, next to `dee-nice`, are `ffmpeg`, `ffprobe`, and a nested `mpv.app`. ffmpeg's libraries sit in `Contents/lib`, which is where that ffmpeg build already looks. mpv keeps its own libraries inside `mpv.app`. They are still separate processes. They are not linked into the Rust binary. `Contents/Resources` holds the GPL text and the notices for mpv and ffmpeg.
+The shipping app is a macOS bundle, built by `scripts/bundle-macos.sh` into `dist/dee-nice.app`. Finder shows one icon. Inside `Contents/MacOS`, next to `dee-nice`, are `ffmpeg`, `ffprobe`, and a nested `mpv.app`. ffmpeg's libraries sit in `Contents/lib`, which is where that ffmpeg build already looks. mpv keeps its own libraries inside `mpv.app`. They are still separate processes. They are not linked into the Rust binary. `Contents/Resources` holds the GPL text, the notices for mpv and ffmpeg, and `AppIcon.icns`. Finder and the Dock use that file. It is the eframe icon.
 
 The shell resolves a bundled tool first, then `DEE_NICE_MPV`, `DEE_NICE_FFMPEG`, or `DEE_NICE_FFPROBE`, then `PATH`. `PATH` is a developer fallback. `cargo run` has no sibling tools, so the overrides still apply there.
