@@ -1,0 +1,13 @@
+[package]
+name = "dee-nice-core"
+description = "Show document, key assignments, and playback bindings for dee-nice"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true
